@@ -14,7 +14,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const { interviewId, transcript, jobRole, numQuestions } = await req.json()
+    const { interviewId, transcript, jobRole, numQuestions, companyName, jdText } = await req.json()
 
     if (!interviewId || !transcript || !Array.isArray(transcript)) {
         return NextResponse.json({ error: 'Missing interviewId or transcript' }, { status: 400 })
@@ -32,40 +32,48 @@ export async function POST(req: NextRequest) {
         .map(entry => `${entry.role === 'ai' ? 'Interviewer' : 'Candidate'}: ${entry.text}`)
         .join('\n\n')
 
-    const evaluationPrompt = `You are an expert interview evaluator. Analyze the following interview transcript and provide a detailed evaluation.
+    const evaluationPrompt = `You are a strict, objective technical interview evaluator. You must analyze the transcript below and evaluate the candidate's performance. The interview was conversational, so questions and answers may span multiple back-and-forth exchanges.
 
-**Interview Context:**
+**CRITICAL RULES:**
+1. **NO HALLUCINATION:** You must ONLY evaluate topics that were ACTUALLY DISCUSSED in the transcript. Do not invent, assume, or pull questions from a template.
+2. Group the conversation into "Core Topics" or "Main Questions" that were assessed.
+3. If the candidate failed to answer, dodged the question, or said "I don't know" to a topic, score THAT topic as 0.0.
+4. **EXACT COUNT:** You must identify and evaluate EXACTLY the first ${numQuestions || 'Unknown'} primary Technical/Core topics the interviewer asked about. If the interviewer asked more than ${numQuestions || 'Unknown'} topics, ignore the extra ones for scoring. If the interviewer asked fewer, only evaluate what was asked. The \`totalQuestions\` field must reflect the true number of core topics you evaluated.
+
+**Interview Context metadata:**
 - Role: ${jobRole || 'Not specified'}
-- Total expected questions: ${numQuestions || 'Unknown'}
+- Company: ${companyName || 'Not specified'}
+- Expected/Requested Question Count: ${numQuestions || 'Unknown'}
+- Job Description Context: ${jdText || 'None provided'}
 
 **Transcript:**
 ${formattedTranscript}
 
 **Your Task:**
-Analyze each question-answer pair from the transcript. For each question the interviewer asked and the candidate answered, provide:
-1. The question text
-2. A score from 0.0 to 1.0 (0 = completely wrong/no answer, 0.5 = partial, 1.0 = excellent answer)
-3. Brief feedback on the answer
+Identify the main topics or questions discussed. For each actual core topic the interviewer tested (up to a maximum of ${numQuestions || 'Unknown'}), provide:
+1. "question": A summary of the core question or topic discussed (e.g., "Explain the CSS Box Model").
+2. "score": A score from 0.0 to 1.0 evaluating the candidate's overall answer(s) on this topic.
+3. "feedback": Brief feedback on the candidate's specific responses regarding this topic.
 
-Then provide an overall summary with specific improvement suggestions.
+Then provide an overall summary with specific improvement suggestions based ONLY on the evidence in the transcript. Include feedback on any casual conversation that happened after the core questions in this summary area.
 
-**IMPORTANT: Respond ONLY with valid JSON in this exact format, no markdown code blocks:**
+**IMPORTANT: Respond ONLY with valid JSON in this exact format:**
 {
     "questions": [
         {
-            "question": "The exact question asked",
+            "question": "Summary of topic or question actually discussed",
             "score": 0.75,
-            "feedback": "Brief feedback on the answer quality"
+            "feedback": "Brief feedback on the answer quality based on the conversation"
         }
     ],
     "totalScore": 7.5,
-    "totalQuestions": 10,
-    "summaryFeedback": "A detailed 3-5 paragraph summary covering: 1) Overall performance assessment, 2) Key strengths demonstrated, 3) Specific weaknesses and areas needing improvement with concrete suggestions on what to study/practice, 4) Actionable next steps for the candidate"
+    "totalQuestions": 1, // The number of distinct core topics evaluated
+    "summaryFeedback": "A detailed 3-5 paragraph summary covering: 1) Overall performance, 2) Key strengths, 3) Specific weaknesses needing improvement, 4) Actionable next steps"
 }`
 
     try {
         const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
+            model: 'gemini-2.0-flash',
             contents: evaluationPrompt,
         })
 

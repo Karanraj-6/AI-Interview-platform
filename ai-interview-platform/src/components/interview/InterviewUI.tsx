@@ -28,19 +28,21 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
     const analyserRef = useRef<AnalyserNode | null>(null);
     const isAISpeakingRef = useRef(false);
 
-    // PCM audio queue for single-stream playback (no more hundreds of AudioBufferSourceNodes)
     const audioQueueRef = useRef<Float32Array[]>([]);
     const isPlayingRef = useRef(false);
     const currentSourceRef = useRef<AudioBufferSourceNode | null>(null);
 
-    // Expose talking state to Avatar
     const [isTalking, setIsTalking] = useState(false);
+    const isTalkingRef = useRef(false);
 
-    // Transcript tracking for post-interview evaluation
     const transcriptRef = useRef<{ role: 'ai' | 'user'; text: string }[]>([]);
     const currentAITurnTextRef = useRef('');
 
-    // Single-stream playback: dequeue PCM chunks and play them one at a time
+    // Accumulation buffer for worklet audio frames
+    const accumulatorRef = useRef<Float32Array[]>([]);
+    const accumulatedLengthRef = useRef(0);
+    const SEND_CHUNK_SIZE = 4096;
+
     const playNextChunk = useCallback(() => {
         const audioCtx = playbackAudioCtxRef.current;
         const analyser = analyserRef.current;
@@ -48,9 +50,15 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
             isPlayingRef.current = false;
             return;
         }
-
+        if (audioCtx.state === 'suspended') {
+            audioCtx.resume();
+        }
         if (audioQueueRef.current.length === 0) {
             isPlayingRef.current = false;
+            if (isTalkingRef.current) {
+                isTalkingRef.current = false;
+                setIsTalking(false);
+            }
             return;
         }
 
@@ -62,55 +70,104 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
 
         const source = audioCtx.createBufferSource();
         source.buffer = buffer;
-        if (analyser) {
-            source.connect(analyser);
-        }
-
+        if (analyser) source.connect(analyser);
         currentSourceRef.current = source;
 
         source.onended = () => {
             currentSourceRef.current = null;
-            // Play next chunk when this one finishes (true sequential single-stream)
             if (audioQueueRef.current.length > 0) {
                 playNextChunk();
             } else {
                 isPlayingRef.current = false;
+                isTalkingRef.current = false;
+                setIsTalking(false);
             }
         };
 
-        source.start(0); // Play immediately
+        source.start(0);
     }, []);
 
-    // Stop everything
+    const stopPlayback = useCallback(() => {
+        audioQueueRef.current = [];
+        if (currentSourceRef.current) {
+            try { currentSourceRef.current.stop(); } catch (_) { }
+            currentSourceRef.current = null;
+        }
+        isPlayingRef.current = false;
+        isTalkingRef.current = false;
+        isAISpeakingRef.current = false;
+        setIsTalking(false);
+    }, []);
+
     const cleanup = useCallback(() => {
         if (sessionRef.current) {
-            try { sessionRef.current.close(); } catch (e) { /* ignore close errors */ }
+            try { sessionRef.current.close(); } catch (e) { }
             sessionRef.current = null;
         }
         if (streamRef.current) {
             streamRef.current.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
         }
         if (inputAudioCtxRef.current && inputAudioCtxRef.current.state !== 'closed') {
             inputAudioCtxRef.current.close();
+            inputAudioCtxRef.current = null;
         }
         if (playbackAudioCtxRef.current && playbackAudioCtxRef.current.state !== 'closed') {
             playbackAudioCtxRef.current.close();
+            playbackAudioCtxRef.current = null;
         }
-
-        // Clear audio queue
         audioQueueRef.current = [];
+        accumulatorRef.current = [];
+        accumulatedLengthRef.current = 0;
         isPlayingRef.current = false;
-
         setIsConnected(false);
     }, []);
 
     useEffect(() => {
-        // Component unmount cleanup
         return cleanup;
     }, [cleanup]);
 
+    const sendAccumulatedAudio = useCallback((session: any, sampleRate: number) => {
+        if (accumulatedLengthRef.current === 0) return;
+
+        const merged = new Float32Array(accumulatedLengthRef.current);
+        let offset = 0;
+        for (const frame of accumulatorRef.current) {
+            merged.set(frame, offset);
+            offset += frame.length;
+        }
+        accumulatorRef.current = [];
+        accumulatedLengthRef.current = 0;
+
+        const targetSampleRate = 16000;
+        let finalData = merged;
+        if (sampleRate !== targetSampleRate) {
+            const ratio = sampleRate / targetSampleRate;
+            const newLength = Math.round(merged.length / ratio);
+            finalData = new Float32Array(newLength);
+            for (let i = 0; i < newLength; i++) {
+                finalData[i] = merged[Math.floor(i * ratio)];
+            }
+        }
+
+        const pcm16 = new Int16Array(finalData.length);
+        for (let i = 0; i < finalData.length; i++) {
+            pcm16[i] = Math.max(-1, Math.min(1, finalData[i])) * 0x7FFF;
+        }
+
+        const bytes = new Uint8Array(pcm16.buffer);
+        let binary = '';
+        const chunkSize = 8192;
+        for (let i = 0; i < bytes.byteLength; i += chunkSize) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize) as unknown as number[]);
+        }
+
+        session.sendRealtimeInput({
+            audio: { data: btoa(binary), mimeType: "audio/pcm;rate=16000" },
+        });
+    }, []);
+
     const startInterview = async () => {
-        // Guard against double-connections
         if (sessionRef.current) {
             console.warn('Session already active, skipping duplicate connect.');
             return;
@@ -118,7 +175,6 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
         setIsInitializing(true);
         setErrorStatus(null);
         try {
-            // 1. Fetch API Token + Company Research in parallel
             const [tokenRes, researchRes] = await Promise.all([
                 fetch('/api/gemini-token'),
                 fetch('/api/company-research', {
@@ -140,79 +196,51 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
                 companyResearch = researchData.research || '';
             }
 
-            // 2. Setup Playback Web Audio API (Output -> Avatar Analyser)
-            const playCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+            // Playback audio context
+            const playCtx = new AudioContext({ sampleRate: 24000 });
             playbackAudioCtxRef.current = playCtx;
             const analyser = playCtx.createAnalyser();
             analyser.fftSize = 256;
             analyser.connect(playCtx.destination);
             analyserRef.current = analyser;
 
-            // 3. Setup Recording Web Audio API (Input -> User Mic)
+            // Mic stream
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
-                    sampleRate: 16000,
                     channelCount: 1,
                     echoCancellation: true,
-                    noiseSuppression: true
+                    noiseSuppression: true,
+                    autoGainControl: true,
                 },
-                video: true
+                video: true,
             });
             streamRef.current = stream;
 
-            const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+            // Input audio context
+            const inputCtx = new AudioContext({ sampleRate: 16000 });
             inputAudioCtxRef.current = inputCtx;
             const micSource = inputCtx.createMediaStreamSource(stream);
-            const processor = inputCtx.createScriptProcessor(4096, 1, 1);
 
-            processor.onaudioprocess = (e) => {
-                if (!isMicOnRef.current || !sessionRef.current) return;
+            // AudioWorklet for low-latency mic capture
+            await inputCtx.audioWorklet.addModule('/audio-processor.worklet.js');
+            const workletNode = new AudioWorkletNode(inputCtx, 'audio-processor');
 
-                const inputData = e.inputBuffer.getChannelData(0);
-                const inputSampleRate = inputCtx.sampleRate;
-                const targetSampleRate = 16000;
+            workletNode.port.onmessage = (e) => {
+                if (!sessionRef.current) return;
 
-                // Downsample if necessary
-                let downsampledData = inputData;
-                if (inputSampleRate !== targetSampleRate) {
-                    const ratio = inputSampleRate / targetSampleRate;
-                    const newLength = Math.round(inputData.length / ratio);
-                    downsampledData = new Float32Array(newLength);
-                    for (let i = 0; i < newLength; i++) {
-                        downsampledData[i] = inputData[Math.floor(i * ratio)];
-                    }
+                const frame: Float32Array = e.data;
+                accumulatorRef.current.push(frame);
+                accumulatedLengthRef.current += frame.length;
+
+                if (accumulatedLengthRef.current >= SEND_CHUNK_SIZE) {
+                    sendAccumulatedAudio(sessionRef.current, inputCtx.sampleRate);
                 }
-
-                // Convert Float32 to Int16
-                const pcm16 = new Int16Array(downsampledData.length);
-                for (let i = 0; i < downsampledData.length; i++) {
-                    pcm16[i] = Math.max(-1, Math.min(1, downsampledData[i])) * 0x7FFF;
-                }
-
-                // Convert to Base64
-                const bytes = new Uint8Array(pcm16.buffer);
-                const chunkSize = 8192;
-                let binary = '';
-                for (let i = 0; i < bytes.byteLength; i += chunkSize) {
-                    const chunk = bytes.subarray(i, i + chunkSize);
-                    binary += String.fromCharCode.apply(null, chunk as unknown as number[]);
-                }
-                const base64 = btoa(binary);
-
-                sessionRef.current.sendRealtimeInput({
-                    audio: { data: base64, mimeType: "audio/pcm;rate=16000" }
-                });
             };
 
-            micSource.connect(processor);
+            // Connect mic → worklet only (NOT to destination — prevents echo/speaker feedback)
+            micSource.connect(workletNode);
 
-            // Prevent mic from playing back through speakers
-            const gainNode = inputCtx.createGain();
-            gainNode.gain.value = 0;
-            processor.connect(gainNode);
-            gainNode.connect(inputCtx.destination);
-
-            // 4. Initialize Gemini Live API
+            // Gemini Live API
             const ai = new GoogleGenAI({ apiKey: token });
 
             const companyContext = interview.company_name
@@ -223,14 +251,16 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
 
 IMPORTANT RULES:
 - You are a single person speaking with one voice only. Never roleplay as multiple people or switch between different voices or personas.
+- Make sure to introduce yourself formally at the very beginning of the interview before asking the first question. Welcome the candidate.
 - The candidate's name is ${userName}.
 - You are interviewing them for the role of ${interview.job_role}.
 - The difficulty level is ${interview.difficulty}.
-- Ask exactly ${interview.num_questions} questions total. Ask them ONE BY ONE. Wait for the candidate to answer before moving to the next question.
-- Provide brief acknowledgment of their answer before asking the next question.
-- When all ${interview.num_questions} questions have been asked and answered, conclude the interview professionally.
-- Internally judge each answer on a scale of 0 to 1 (0 = completely wrong, 0.5 = partial, 1.0 = excellent). Do NOT share the scores during the interview.
-- Mix your questions across: company-specific questions, role-specific technical questions, JD-relevant questions, behavioral questions, and your own AI-generated questions relevant to the role.
+- Ask roughly ${interview.num_questions} main questions across the interview.
+- CRITICAL: DO NOT INTERRUPT THE CANDIDATE. The candidate may pause to think. You must wait patiently until they are completely finished with their entire answer before you respond.
+- Ask follow-up questions and dig deeper into their answers, but only AFTER they have fully completed their thought.
+- Once you feel you have adequately evaluated their knowledge across roughly ${interview.num_questions} main topics, conclude the interview professionally.
+- Internally judge their overall knowledge on each main topic on a scale of 0 to 1 (0 = completely wrong, 0.5 = partial, 1.0 = excellent). Do NOT share the scores during the interview.
+- Mix your questions across: company-specific questions, role-specific technical questions, JD-relevant questions, and behavioral questions and your own AI-generated questions relevant to the role.
 `;
             if (interview.interview_round) textInstruction += `\nThis is a ${interview.interview_round} round interview. Tailor your question style accordingly.`;
             if (interview.language) textInstruction += `\nConduct the entire interview strictly in the language code: ${interview.language}.`;
@@ -243,35 +273,37 @@ IMPORTANT RULES:
                     responseModalities: ["AUDIO"] as any,
                     systemInstruction: textInstruction,
                     speechConfig: {
-                        voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } }
+                        voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } },
                     },
                 },
                 callbacks: {
                     onmessage: (message: any) => {
-                        // AI is generating audio
-                        if (message.serverContent && message.serverContent.modelTurn) {
+                        // AI audio chunks arriving
+                        if (message.serverContent?.modelTurn) {
                             isAISpeakingRef.current = true;
-                            setIsTalking(true);
+                            // Slight delay so avatar lip sync aligns with audio playback
+                            setTimeout(() => {
+                                if (isAISpeakingRef.current) {
+                                    isTalkingRef.current = true;
+                                    setIsTalking(true);
+                                }
+                            }, 200);
+
                             const parts = message.serverContent.modelTurn.parts;
                             for (const part of parts) {
                                 if (part.inlineData) {
-                                    const base64 = part.inlineData.data;
-                                    const binaryData = atob(base64);
+                                    const binaryData = atob(part.inlineData.data);
                                     const bytes = new Uint8Array(binaryData.length);
                                     for (let i = 0; i < binaryData.length; i++) {
                                         bytes[i] = binaryData.charCodeAt(i);
                                     }
-                                    // Decode 16-bit PCM at 24kHz
                                     const float32Data = new Float32Array(bytes.length / 2);
                                     const dataView = new DataView(bytes.buffer);
-                                    for (let i = 0; i < bytes.length / 2; i++) {
+                                    for (let i = 0; i < float32Data.length; i++) {
                                         float32Data[i] = dataView.getInt16(i * 2, true) / 32768.0;
                                     }
 
-                                    // Push to queue instead of creating individual sources
                                     audioQueueRef.current.push(float32Data);
-
-                                    // Start playback if not already playing
                                     if (!isPlayingRef.current) {
                                         playNextChunk();
                                     }
@@ -283,29 +315,24 @@ IMPORTANT RULES:
                             }
                         }
 
-                        // User interrupted the AI — stop playback immediately
-                        if (message.serverContent && message.serverContent.interrupted) {
-                            audioQueueRef.current = [];
-                            if (currentSourceRef.current) {
-                                try { currentSourceRef.current.stop(); } catch (_) { /* already stopped */ }
-                                currentSourceRef.current = null;
-                            }
-                            isPlayingRef.current = false;
-                            isAISpeakingRef.current = false;
-                            setIsTalking(false);
+                        // Gemini detected user interrupted AI — stop playback immediately
+                        if (message.serverContent?.interrupted) {
+                            stopPlayback();
                         }
 
-                        // AI finished generating (no interruption)
-                        if (message.serverContent && message.serverContent.generationComplete) {
+                        // AI turn fully done — save transcript + wait for playback to finish
+                        if (message.serverContent?.generationComplete) {
                             // Save completed AI turn to transcript
                             if (currentAITurnTextRef.current.trim()) {
                                 transcriptRef.current.push({ role: 'ai', text: currentAITurnTextRef.current.trim() });
                                 currentAITurnTextRef.current = '';
                             }
 
+                            // Poll until audio playback is fully done, then reset talking state
                             const checkPlaybackDone = () => {
                                 if (audioQueueRef.current.length === 0 && !isPlayingRef.current) {
                                     isAISpeakingRef.current = false;
+                                    isTalkingRef.current = false;
                                     setIsTalking(false);
                                 } else {
                                     setTimeout(checkPlaybackDone, 200);
@@ -314,8 +341,8 @@ IMPORTANT RULES:
                             checkPlaybackDone();
                         }
 
-                        // Capture user speech input text (if Gemini transcribes it)
-                        if (message.serverContent && message.serverContent.inputTranscript) {
+                        // Gemini transcribed user speech — save to transcript
+                        if (message.serverContent?.inputTranscript) {
                             transcriptRef.current.push({ role: 'user', text: message.serverContent.inputTranscript });
                         }
                     },
@@ -327,13 +354,27 @@ IMPORTANT RULES:
                     onerror: (e: any) => {
                         console.error("Live session error event:", e);
                         setErrorStatus(`Socket Error: ${e.message || "Unknown error"}`);
-                    }
-                }
+                    },
+                },
             });
 
             sessionRef.current = session;
             setIsConnected(true);
             setIsInitializing(false);
+
+            // Auto-enable mic
+            if (!isMicOnRef.current) {
+                toggleMic();
+            }
+
+            // Resume playback context (required after user gesture)
+            await playCtx.resume();
+
+            // Kick off AI introduction via text turn
+            (session as any).sendClientContent({
+                turns: [{ role: "user", parts: [{ text: "Please begin the interview now." }] }],
+                turnComplete: true,
+            });
 
         } catch (err: any) {
             console.error(err);
@@ -343,8 +384,18 @@ IMPORTANT RULES:
     };
 
     const handleEndInterview = async () => {
+        // Flush any remaining AI turn text into transcript before evaluating
+        if (currentAITurnTextRef.current.trim()) {
+            transcriptRef.current.push({ role: 'ai', text: currentAITurnTextRef.current.trim() });
+            currentAITurnTextRef.current = '';
+        }
+
         cleanup();
         setIsEvaluating(true);
+
+        // Debug logs — share these in console
+        console.log('Transcript before evaluation:', transcriptRef.current);
+        console.log('Interview ID:', interview.id);
 
         try {
             const res = await fetch('/api/evaluate-interview', {
@@ -355,17 +406,20 @@ IMPORTANT RULES:
                     transcript: transcriptRef.current,
                     jobRole: interview.job_role,
                     numQuestions: interview.num_questions,
+                    companyName: interview.company_name,
+                    jdText: interview.jd_text,
                 }),
             });
 
             if (res.ok) {
                 router.push(`/dashboard/results/${interview.id}`);
             } else {
-                console.error('Evaluation failed');
+                const errorBody = await res.text();
+                console.error('Evaluation failed — status:', res.status, 'body:', errorBody);
                 router.push('/dashboard/profile');
             }
         } catch (err) {
-            console.error('Evaluation error:', err);
+            console.error('Evaluation network error:', err);
             router.push('/dashboard/profile');
         }
     };
@@ -436,7 +490,7 @@ IMPORTANT RULES:
                     </div>
                 ) : null}
 
-                {!isInitializing && !errorStatus && !isConnected ? (
+                {!isInitializing && !errorStatus && !isConnected && !isEvaluating ? (
                     <div className="flex flex-col items-center gap-6">
                         <div className="text-center space-y-2">
                             <h2 className="text-2xl font-bold">Ready when you are</h2>
@@ -450,12 +504,9 @@ IMPORTANT RULES:
 
                 {isConnected && (
                     <div className="w-full h-full flex items-center justify-center relative">
-                        {/* The Avatar stretched 16:9 */}
                         <div className="z-0 animate-in fade-in zoom-in duration-700 w-full h-full">
                             <Avatar isTalking={isTalking} />
                         </div>
-
-                        {/* Webcam Floating Bottom Right */}
                         <div className="absolute bottom-6 right-6 z-20 animate-in slide-in-from-bottom flex shadow-2xl">
                             <Webcam stream={streamRef.current} />
                         </div>
@@ -495,5 +546,5 @@ IMPORTANT RULES:
                 </Button>
             </footer>
         </div>
-    )
+    );
 }

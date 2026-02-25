@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
 import Link from "next/link";
 import gsap from "gsap";
 import { ScrollTrigger } from "gsap/ScrollTrigger";
-import Squares from "./Squares";
+import Orb from "./Orb";
 
 gsap.registerPlugin(ScrollTrigger);
 
@@ -129,13 +129,15 @@ export default function LandingPage() {
     return (
         <div className="landing-root">
             <div className="landing-bg-wrap">
-                <Squares
-                    speed={0.5}
-                    squareSize={40}
-                    direction="diagonal"
-                    borderColor="#5a2aac"
-                    hoverFillColor="#3021a1"
-                />
+                <div style={{ width: '100%', height: '100%', position: 'absolute' }}>
+                    <Orb
+                        hoverIntensity={0.82}
+                        rotateOnHover
+                        hue={360}
+                        forceHoverState={false}
+                        backgroundColor="#2b2989"
+                    />
+                </div>
             </div>
 
             {/* ── Hero ── */}

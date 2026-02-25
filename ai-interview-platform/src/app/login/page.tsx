@@ -8,7 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card, CardHeader, CardTitle, CardDescription, CardContent, CardFooter } from '@/components/ui/card'
-import Squares from '@/components/Squares'
+import Orb from '@/components/Orb'
 
 export default function LoginPage() {
     const [error, setError] = useState<string | null>(null)
@@ -36,13 +36,15 @@ export default function LoginPage() {
     return (
         <div className="relative min-h-screen flex items-center justify-center bg-zinc-950 p-4 overflow-hidden">
             <div className="absolute inset-0 z-0">
-                <Squares
-                    speed={0.5}
-                    squareSize={40}
-                    direction="diagonal"
-                    borderColor="#5a2aac"
-                    hoverFillColor="#3021a1"
-                />
+                <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+                    <Orb
+                        hoverIntensity={0.82}
+                        rotateOnHover
+                        hue={360}
+                        forceHoverState={false}
+                        backgroundColor="#2b2989"
+                    />
+                </div>
             </div>
             <Card className="z-10 w-full max-w-lg shadow-2xl border-zinc-800 bg-zinc-950/80 backdrop-blur-sm">
                 <CardHeader className="space-y-3 pb-6">
@@ -60,7 +62,7 @@ export default function LoginPage() {
                             <Input id="password" name="password" type="password" required className="h-12 text-lg bg-zinc-900/50 border-zinc-800 text-zinc-100" />
                         </div>
                         {error && <p className="text-base text-red-500">{error}</p>}
-                        <Button type="submit" className="w-full h-12 text-lg font-medium" disabled={loading}>
+                        <Button type="submit" className="w-full h-12 text-lg font-medium bg-indigo-600 hover:bg-indigo-700 text-white" disabled={loading}>
                             {loading ? "Logging in..." : "Login"}
                         </Button>
                     </form>
@@ -68,7 +70,7 @@ export default function LoginPage() {
                 <CardFooter className="flex justify-center flex-col space-y-4 pt-6">
                     <p className="text-base text-center text-zinc-400">
                         Don't have an account?{" "}
-                        <Link href="/register" className="text-primary underline hover:text-primary/80 transition-colors">
+                        <Link href="/register" className="text-indigo-400 underline hover:text-indigo-300 transition-colors">
                             Register here
                         </Link>
                     </p>

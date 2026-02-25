@@ -47,3 +47,44 @@ export async function createInterview(formData: FormData) {
     // Redirect to the interview UI
     redirect(`/interview/${data.id}`)
 }
+
+export async function getDashboardData() {
+    const supabase = await createClient()
+
+    const { data: { user }, error: authError } = await supabase.auth.getUser()
+    if (authError || !user) {
+        return { error: 'Not authenticated' }
+    }
+
+    const { data: interviews, error } = await supabase
+        .from('interviews')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+
+    if (error) {
+        return { error: 'Failed to fetch interviews' }
+    }
+
+    const totalInterviews = interviews?.length || 0
+    const completedInterviews = interviews?.filter(i => i.final_score !== null) || []
+
+    const avgScore = completedInterviews.length > 0
+        ? (completedInterviews.reduce((acc, curr) => acc + (curr.final_score || 0), 0) / completedInterviews.length).toFixed(1)
+        : 'N/A'
+
+    // Approximate time spent
+    const practiceTimeMins = interviews?.reduce((acc, curr) => acc + ((curr.num_questions || 10) * 2), 0) || 0
+    const practiceHours = Math.floor(practiceTimeMins / 60)
+    const practiceRemainingMins = practiceTimeMins % 60
+    const practiceTimeStr = `${practiceHours}h ${practiceRemainingMins}m`
+
+    const recentInterviews = interviews?.slice(0, 3) || []
+
+    return {
+        totalInterviews,
+        avgScore,
+        practiceTimeStr,
+        recentInterviews
+    }
+}
