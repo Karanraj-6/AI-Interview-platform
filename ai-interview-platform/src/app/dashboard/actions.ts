@@ -41,7 +41,7 @@ export async function createInterview(formData: FormData) {
 
     if (error || !data) {
         console.error('Failed to create interview:', error)
-        return { error: 'Could not create interview session' }
+        return { error: `Could not create interview session: ${error?.message || 'Unknown error'}` }
     }
 
     // Redirect to the interview UI
@@ -73,10 +73,10 @@ export async function getDashboardData() {
         ? (completedInterviews.reduce((acc, curr) => acc + (curr.final_score || 0), 0) / completedInterviews.length).toFixed(1)
         : 'N/A'
 
-    // Approximate time spent
-    const practiceTimeMins = interviews?.reduce((acc, curr) => acc + ((curr.num_questions || 10) * 2), 0) || 0
-    const practiceHours = Math.floor(practiceTimeMins / 60)
-    const practiceRemainingMins = practiceTimeMins % 60
+    // Real active time from recorded durations (fallback to 0 for old interviews without tracking)
+    const totalSeconds = interviews?.reduce((acc, curr) => acc + (curr.duration_seconds || 0), 0) || 0
+    const practiceHours = Math.floor(totalSeconds / 3600)
+    const practiceRemainingMins = Math.floor((totalSeconds % 3600) / 60)
     const practiceTimeStr = `${practiceHours}h ${practiceRemainingMins}m`
 
     const recentInterviews = interviews?.slice(0, 3) || []

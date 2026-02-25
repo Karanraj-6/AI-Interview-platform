@@ -16,6 +16,7 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
     const [isInitializing, setIsInitializing] = useState(false);
     const [isEvaluating, setIsEvaluating] = useState(false);
     const [errorStatus, setErrorStatus] = useState<string | null>(null);
+    const [evaluationError, setEvaluationError] = useState<string | null>(null);
 
     // Refs to prevent state closure issues inside callbacks
     const isMicOnRef = useRef(isMicOn);
@@ -27,6 +28,7 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
     const playbackAudioCtxRef = useRef<AudioContext | null>(null);
     const analyserRef = useRef<AnalyserNode | null>(null);
     const isAISpeakingRef = useRef(false);
+    const avatarActivatedRef = useRef(false); // true once the initial lip-sync delay has passed
 
     const audioQueueRef = useRef<Float32Array[]>([]);
     const isPlayingRef = useRef(false);
@@ -37,11 +39,14 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
 
     const transcriptRef = useRef<{ role: 'ai' | 'user'; text: string }[]>([]);
     const currentAITurnTextRef = useRef('');
+    const currentUserTurnTextRef = useRef('');
+    const interviewStartTimeRef = useRef<number>(0);
+    const recognitionRef = useRef<any>(null);
 
-    // Accumulation buffer for worklet audio frames
+    // Small accumulation buffer — 1600 samples = 100ms at 16kHz (optimal WebSocket batch size)
     const accumulatorRef = useRef<Float32Array[]>([]);
     const accumulatedLengthRef = useRef(0);
-    const SEND_CHUNK_SIZE = 4096;
+    const SEND_CHUNK_SIZE = 1600;
 
     const playNextChunk = useCallback(() => {
         const audioCtx = playbackAudioCtxRef.current;
@@ -55,10 +60,8 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
         }
         if (audioQueueRef.current.length === 0) {
             isPlayingRef.current = false;
-            if (isTalkingRef.current) {
-                isTalkingRef.current = false;
-                setIsTalking(false);
-            }
+            // Don't reset isTalking here — let checkPlaybackDone handle it
+            // (prevents avatar flickering when queue temporarily empties between chunks)
             return;
         }
 
@@ -79,8 +82,7 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
                 playNextChunk();
             } else {
                 isPlayingRef.current = false;
-                isTalkingRef.current = false;
-                setIsTalking(false);
+                // Don't reset isTalking — checkPlaybackDone will handle it
             }
         };
 
@@ -127,9 +129,10 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
         return cleanup;
     }, [cleanup]);
 
-    const sendAccumulatedAudio = useCallback((session: any, sampleRate: number) => {
+    const sendAudioFrame = useCallback((session: any, sampleRate: number) => {
         if (accumulatedLengthRef.current === 0) return;
 
+        // Merge accumulated frames
         const merged = new Float32Array(accumulatedLengthRef.current);
         let offset = 0;
         for (const frame of accumulatorRef.current) {
@@ -139,10 +142,11 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
         accumulatorRef.current = [];
         accumulatedLengthRef.current = 0;
 
-        const targetSampleRate = 16000;
+        // Resample to 16kHz if browser gave us a different rate
+        const targetRate = 16000;
         let finalData = merged;
-        if (sampleRate !== targetSampleRate) {
-            const ratio = sampleRate / targetSampleRate;
+        if (Math.abs(sampleRate - targetRate) > 100) {
+            const ratio = sampleRate / targetRate;
             const newLength = Math.round(merged.length / ratio);
             finalData = new Float32Array(newLength);
             for (let i = 0; i < newLength; i++) {
@@ -150,16 +154,17 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
             }
         }
 
+        // Convert Float32 → Int16 PCM
         const pcm16 = new Int16Array(finalData.length);
         for (let i = 0; i < finalData.length; i++) {
             pcm16[i] = Math.max(-1, Math.min(1, finalData[i])) * 0x7FFF;
         }
 
+        // Convert to base64 and send
         const bytes = new Uint8Array(pcm16.buffer);
         let binary = '';
-        const chunkSize = 8192;
-        for (let i = 0; i < bytes.byteLength; i += chunkSize) {
-            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize) as unknown as number[]);
+        for (let i = 0; i < bytes.byteLength; i += 8192) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192) as unknown as number[]);
         }
 
         session.sendRealtimeInput({
@@ -216,6 +221,46 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
             });
             streamRef.current = stream;
 
+            // Setup Browser Web Speech API for user transcription fallback
+            // (Gemini Live preview doesn't reliably send inputTranscription events yet)
+            const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+            if (SpeechRecognition) {
+                const recognition = new SpeechRecognition();
+                recognition.continuous = true;
+                recognition.interimResults = true;
+                // Use the language selected in the interview setup
+                recognition.lang = interview.language || 'en-IN';
+
+                recognition.onresult = (event: any) => {
+                    let interimTranscript = '';
+                    let finalTranscript = '';
+
+                    for (let i = event.resultIndex; i < event.results.length; ++i) {
+                        if (event.results[i].isFinal) {
+                            finalTranscript += event.results[i][0].transcript;
+                        } else {
+                            interimTranscript += event.results[i][0].transcript;
+                        }
+                    }
+
+                    if (finalTranscript) {
+                        console.log("Browser Speech Fallback:", finalTranscript);
+                        currentUserTurnTextRef.current += " " + finalTranscript;
+                    }
+                };
+
+                recognition.onerror = (e: any) => console.log("Speech recognition error:", e);
+
+                // Keep it running continuously
+                recognition.onend = () => {
+                    if (sessionRef.current && isMicOnRef.current) {
+                        try { recognition.start(); } catch (e) { }
+                    }
+                };
+
+                recognitionRef.current = recognition;
+            }
+
             // Input audio context
             const inputCtx = new AudioContext({ sampleRate: 16000 });
             inputAudioCtxRef.current = inputCtx;
@@ -227,13 +272,12 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
 
             workletNode.port.onmessage = (e) => {
                 if (!sessionRef.current) return;
-
                 const frame: Float32Array = e.data;
                 accumulatorRef.current.push(frame);
                 accumulatedLengthRef.current += frame.length;
-
+                // Send when we have ~100ms of audio (1600 samples at 16kHz)
                 if (accumulatedLengthRef.current >= SEND_CHUNK_SIZE) {
-                    sendAccumulatedAudio(sessionRef.current, inputCtx.sampleRate);
+                    sendAudioFrame(sessionRef.current, inputCtx.sampleRate);
                 }
             };
 
@@ -251,16 +295,34 @@ export default function InterviewUI({ interview, userName }: { interview: any, u
 
 IMPORTANT RULES:
 - You are a single person speaking with one voice only. Never roleplay as multiple people or switch between different voices or personas.
-- Make sure to introduce yourself formally at the very beginning of the interview before asking the first question. Welcome the candidate.
+- Make sure to introduce yourself formally at the very beginning of the interview. Start speaking immediately as soon as the session begins — do not wait for the candidate to speak first. Welcome the candidate.
+- After your introduction, ask the candidate to briefly introduce themselves — their name, background, and experience relevant to the role. Wait for their full introduction before proceeding to technical questions.
 - The candidate's name is ${userName}.
 - You are interviewing them for the role of ${interview.job_role}.
 - The difficulty level is ${interview.difficulty}.
-- Ask roughly ${interview.num_questions} main questions across the interview.
+
+QUESTION COUNTING & TRACKING:
+- You must ask EXACTLY ${interview.num_questions} main/core questions during this interview.
+- Maintain an internal question counter starting at 0. Every time you ask a NEW distinct technical or behavioral question, increment the counter by 1.
+- When asking a new core question, always prefix it by saying the question number naturally, e.g. "For my first question...", "Moving on to question two...", "Alright, question three...", etc.
+- Follow-up questions, clarifications, "can you elaborate?", "tell me more about that", or supportive/conversational responses do NOT count as new questions. Only increment the counter for genuinely new, distinct topics.
+- Once your internal counter reaches ${interview.num_questions}, STOP asking new questions.
+
+CONVERSATION STYLE:
+- CRITICAL: DO INTERRUPT YOUR RESPONCE AND LISTEN TO THE CANDIDATE IF HE START SPEAKING IN MIDDLE OF YOUR RESPONCE.
 - CRITICAL: DO NOT INTERRUPT THE CANDIDATE. The candidate may pause to think. You must wait patiently until they are completely finished with their entire answer before you respond.
-- Ask follow-up questions and dig deeper into their answers, but only AFTER they have fully completed their thought.
-- Once you feel you have adequately evaluated their knowledge across roughly ${interview.num_questions} main topics, conclude the interview professionally.
+- IMPORTANT: After the candidate answers each core question, DO NOT jump straight to the next question. Instead, engage in a brief back-and-forth discussion:
+  1. First, acknowledge their answer with a brief comment (agree, appreciate, or gently point out something interesting).
+  2. Then ask 1-2 follow-up questions to dig deeper — e.g. "Can you walk me through how you'd implement that?", "What would happen if...?", "Have you faced a scenario where...?".
+  3. Only move on to the next core question after you've explored the current topic sufficiently.
+- These follow-up questions do NOT count toward the ${interview.num_questions} question limit.
 - Internally judge their overall knowledge on each main topic on a scale of 0 to 1 (0 = completely wrong, 0.5 = partial, 1.0 = excellent). Do NOT share the scores during the interview.
-- Mix your questions across: company-specific questions, role-specific technical questions, JD-relevant questions, and behavioral questions and your own AI-generated questions relevant to the role.
+- Mix your questions across: company-specific questions, role-specific technical questions, JD-relevant questions, behavioral questions, and your own AI-generated questions relevant to the role.
+
+CLOSING THE INTERVIEW:
+- After you have asked all ${interview.num_questions} core questions and received answers, you MUST ask: "Before we wrap up, do you have any questions for me or anything you'd like to discuss?"
+- After the candidate responds to that, conclude professionally by thanking them and saying something like: "That concludes our interview. You may now end the call to see your evaluation scores. It was great speaking with you!"
+- Do NOT reveal any scores or detailed feedback during the interview itself.
 `;
             if (interview.interview_round) textInstruction += `\nThis is a ${interview.interview_round} round interview. Tailor your question style accordingly.`;
             if (interview.language) textInstruction += `\nConduct the entire interview strictly in the language code: ${interview.language}.`;
@@ -275,19 +337,45 @@ IMPORTANT RULES:
                     speechConfig: {
                         voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } },
                     },
+                    // Transcription configs for capturing AI speech (input transcription not supported by SDK yet)
+                    outputAudioTranscription: {},
                 },
                 callbacks: {
                     onmessage: (message: any) => {
+                        // Debug: log non-audio message types (inputTranscript, generationComplete, etc.)
+                        const keys = Object.keys(message.serverContent || {});
+                        const noisy = ['modelTurn', 'outputTranscription'];
+                        if (keys.length > 0 && keys.some(k => !noisy.includes(k))) {
+                            console.log('Gemini event:', keys, message.serverContent);
+                        }
+
                         // AI audio chunks arriving
                         if (message.serverContent?.modelTurn) {
+                            // Flush accumulated user speech before AI turn starts
+                            if (currentUserTurnTextRef.current.trim()) {
+                                transcriptRef.current.push({ role: 'user', text: currentUserTurnTextRef.current.trim() });
+                                currentUserTurnTextRef.current = '';
+                            }
                             isAISpeakingRef.current = true;
-                            // Slight delay so avatar lip sync aligns with audio playback
-                            setTimeout(() => {
-                                if (isAISpeakingRef.current) {
-                                    isTalkingRef.current = true;
-                                    setIsTalking(true);
-                                }
-                            }, 200);
+
+                            // Very first AI turn (intro) — delay so avatar syncs with buffered audio
+                            if (!avatarActivatedRef.current) {
+                                setTimeout(() => {
+                                    if (isAISpeakingRef.current) {
+                                        avatarActivatedRef.current = true;
+                                        isTalkingRef.current = true;
+                                        setIsTalking(true);
+                                    }
+                                }, 2500);
+                            } else {
+                                // All subsequent turns — 200ms sync
+                                setTimeout(() => {
+                                    if (isAISpeakingRef.current) {
+                                        isTalkingRef.current = true;
+                                        setIsTalking(true);
+                                    }
+                                }, 200);
+                            }
 
                             const parts = message.serverContent.modelTurn.parts;
                             for (const part of parts) {
@@ -308,10 +396,8 @@ IMPORTANT RULES:
                                         playNextChunk();
                                     }
                                 }
-                                if (part.text) {
-                                    addMessage({ id: Date.now().toString(), role: 'ai', text: part.text });
-                                    currentAITurnTextRef.current += part.text;
-                                }
+                                // NOTE: part.text from native audio model is THINKING text, not spoken words.
+                                // We intentionally skip it for transcript. Only outputTranscript has actual speech.
                             }
                         }
 
@@ -322,7 +408,7 @@ IMPORTANT RULES:
 
                         // AI turn fully done — save transcript + wait for playback to finish
                         if (message.serverContent?.generationComplete) {
-                            // Save completed AI turn to transcript
+                            // Save completed AI turn to transcript (from outputTranscript only)
                             if (currentAITurnTextRef.current.trim()) {
                                 transcriptRef.current.push({ role: 'ai', text: currentAITurnTextRef.current.trim() });
                                 currentAITurnTextRef.current = '';
@@ -341,9 +427,19 @@ IMPORTANT RULES:
                             checkPlaybackDone();
                         }
 
-                        // Gemini transcribed user speech — save to transcript
-                        if (message.serverContent?.inputTranscript) {
-                            transcriptRef.current.push({ role: 'user', text: message.serverContent.inputTranscript });
+                        // Gemini transcribed user speech — accumulate fragments
+                        if (message.serverContent?.inputTranscription) {
+                            const userText = message.serverContent.inputTranscription.text || message.serverContent.inputTranscription;
+                            if (typeof userText === 'string') {
+                                currentUserTurnTextRef.current += userText;
+                            }
+                        }
+                        // Gemini transcribed AI speech — this is what was ACTUALLY SPOKEN (not thinking)
+                        if (message.serverContent?.outputTranscription) {
+                            const aiText = message.serverContent.outputTranscription.text || message.serverContent.outputTranscription;
+                            if (typeof aiText === 'string') {
+                                currentAITurnTextRef.current += aiText;
+                            }
                         }
                     },
                     onclose: (e: any) => {
@@ -359,6 +455,7 @@ IMPORTANT RULES:
             });
 
             sessionRef.current = session;
+            interviewStartTimeRef.current = Date.now();
             setIsConnected(true);
             setIsInitializing(false);
 
@@ -370,7 +467,16 @@ IMPORTANT RULES:
             // Resume playback context (required after user gesture)
             await playCtx.resume();
 
-            // Kick off AI introduction via text turn
+            // Start browser speech recognition if available
+            if (recognitionRef.current) {
+                try {
+                    recognitionRef.current.start();
+                } catch (e) {
+                    console.log("Speech recognition start error:", e);
+                }
+            }
+
+            // Kick off AI introduction immediately
             (session as any).sendClientContent({
                 turns: [{ role: "user", parts: [{ text: "Please begin the interview now." }] }],
                 turnComplete: true,
@@ -389,12 +495,18 @@ IMPORTANT RULES:
             transcriptRef.current.push({ role: 'ai', text: currentAITurnTextRef.current.trim() });
             currentAITurnTextRef.current = '';
         }
+        // Flush any remaining user speech
+        if (currentUserTurnTextRef.current.trim()) {
+            transcriptRef.current.push({ role: 'user', text: currentUserTurnTextRef.current.trim() });
+            currentUserTurnTextRef.current = '';
+        }
 
         cleanup();
         setIsEvaluating(true);
 
-        // Debug logs — share these in console
-        console.log('Transcript before evaluation:', transcriptRef.current);
+        // Debug: log full transcript content
+        console.log('Transcript before evaluation:', JSON.stringify(transcriptRef.current, null, 2));
+        console.log('Transcript length:', transcriptRef.current.length);
         console.log('Interview ID:', interview.id);
 
         try {
@@ -408,6 +520,9 @@ IMPORTANT RULES:
                     numQuestions: interview.num_questions,
                     companyName: interview.company_name,
                     jdText: interview.jd_text,
+                    durationSeconds: interviewStartTimeRef.current
+                        ? Math.round((Date.now() - interviewStartTimeRef.current) / 1000)
+                        : 0,
                 }),
             });
 
@@ -416,11 +531,17 @@ IMPORTANT RULES:
             } else {
                 const errorBody = await res.text();
                 console.error('Evaluation failed — status:', res.status, 'body:', errorBody);
-                router.push('/dashboard/profile');
+                setIsEvaluating(false);
+                if (res.status === 429) {
+                    setEvaluationError('API rate limit reached. Please wait a moment and try again.');
+                } else {
+                    setEvaluationError('Evaluation failed. You can retry or view your dashboard.');
+                }
             }
         } catch (err) {
             console.error('Evaluation network error:', err);
-            router.push('/dashboard/profile');
+            setIsEvaluating(false);
+            setEvaluationError('Network error during evaluation. Please check your connection and retry.');
         }
     };
 
@@ -455,7 +576,34 @@ IMPORTANT RULES:
             {/* Main Content */}
             <main className="flex-1 flex flex-col items-center justify-center relative overflow-hidden p-4">
 
-                {isEvaluating ? (
+                {evaluationError ? (
+                    <div className="flex flex-col items-center justify-center space-y-6 max-w-sm text-center">
+                        <div className="w-20 h-20 rounded-full bg-red-900/20 flex items-center justify-center border border-red-800/50">
+                            <svg className="w-8 h-8 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z" />
+                            </svg>
+                        </div>
+                        <div>
+                            <h2 className="text-2xl font-semibold mb-2 text-white">Evaluation Error</h2>
+                            <p className="text-zinc-400 mb-4">{evaluationError}</p>
+                        </div>
+                        <div className="flex gap-3">
+                            <Button
+                                onClick={() => { setEvaluationError(null); setIsEvaluating(true); handleEndInterview(); }}
+                                className="bg-indigo-600 hover:bg-indigo-700 text-white px-6"
+                            >
+                                Retry Evaluation
+                            </Button>
+                            <Button
+                                onClick={() => router.push('/dashboard/profile')}
+                                variant="outline"
+                                className="border-zinc-700 text-zinc-300 hover:bg-zinc-800 px-6"
+                            >
+                                Skip to Dashboard
+                            </Button>
+                        </div>
+                    </div>
+                ) : isEvaluating ? (
                     <div className="flex flex-col items-center justify-center space-y-6 max-w-sm text-center">
                         <div className="w-20 h-20 rounded-full bg-indigo-900/20 flex items-center justify-center border border-indigo-800/50">
                             <Loader2 className="w-8 h-8 text-indigo-400 animate-spin" />

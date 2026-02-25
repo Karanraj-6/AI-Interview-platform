@@ -48,9 +48,9 @@ export default async function ResultsPage({ params }: { params: { id: string } }
                         {new Date(interview.created_at).toLocaleDateString('en-US', { dateStyle: 'long' })}
                     </p>
                 </div>
-                <Link href="/dashboard/profile">
+                <Link href="/dashboard">
                     <Button variant="outline" className="border-zinc-700 hover:bg-zinc-800 text-zinc-300">
-                        ← Back to Profile
+                        ← Back to Dashboard
                     </Button>
                 </Link>
             </div>

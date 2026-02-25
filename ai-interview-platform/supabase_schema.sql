@@ -22,6 +22,7 @@ create table if not exists public.interviews (
   num_questions integer not null,
   jd_text text,
   final_score integer,
+  duration_seconds integer,
   created_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
 

@@ -168,13 +168,14 @@ export default function DashboardPage() {
 
                                         <div className="space-y-2">
                                             <Label htmlFor="language" className="text-zinc-200">Interview Language</Label>
-                                            <Select name="language" defaultValue="en-US">
+                                            <Select name="language" defaultValue="en-IN">
                                                 <SelectTrigger className="bg-zinc-900 border-zinc-800 text-white focus:ring-indigo-500">
                                                     <SelectValue placeholder="Select language" />
                                                 </SelectTrigger>
                                                 <SelectContent className="bg-zinc-900 border-zinc-800 text-white">
                                                     <SelectItem value="en-US">English (US)</SelectItem>
                                                     <SelectItem value="en-GB">English (UK)</SelectItem>
+                                                    <SelectItem value="en-IN">English (India)</SelectItem>
                                                     <SelectItem value="es-ES">Spanish</SelectItem>
                                                     <SelectItem value="fr-FR">French</SelectItem>
                                                     <SelectItem value="hi-IN">Hindi</SelectItem>
